@@ -13,7 +13,7 @@
 |------|-------------|
 | **Merge PDF** | Combine multiple PDFs into one document |
 | **Split PDF** | Extract pages into separate PDF files |
-| **Compress PDF** | Reduce PDF file size |
+| **Compress PDF** | Reduce PDF file size (real image recompression via Ghostscript WASM) |
 | **Organize PDF** | Reorder, remove, and rearrange pages via drag-and-drop |
 | **Rotate PDF** | Rotate individual pages by 90°, 180°, or 270° |
 | **Watermark PDF** | Add text watermarks with custom position, color, opacity, and rotation |
@@ -70,6 +70,7 @@ All processing is powered by industry-standard open-source libraries compiled to
 - **[docx](https://docx.js.org/)** — Word document generation
 - **[SheetJS](https://sheetjs.com/)** — Excel file processing
 - **[Tesseract.js](https://tesseract.projectnaptha.com/)** — OCR in the browser
+- **[Ghostscript (WASM)](https://github.com/jsscheller/ghostscript-wasm)** — Real PDF recompression (Compress PDF)
 - **[JSZip](https://stuk.github.io/jszip/)** — Archive handling
 - **[SortableJS](https://sortablejs.github.io/Sortable/)** — Drag-and-drop page reordering
 
