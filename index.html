@@ -35,7 +35,7 @@
   <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/gh/gitbrent/PptxGenJS@3.12.0/dist/pptxgen.bundle.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.min.js"></script>
   <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
@@ -356,12 +356,196 @@
         .replace(/'/g, '&#39;');
     }
 
-    // Strip a trailing .pdf (any casing) and append the new suffix, so that
-    // 'REPORT.PDF' becomes 'REPORT-compressed.pdf' rather than staying untouched.
+    // Strip the file's own extension (any casing) and append the new suffix, so
+    // that 'REPORT.PDF' becomes 'REPORT-compressed.pdf' rather than staying
+    // untouched. Works for every extension, not just .pdf.
     function outputFileName(name, suffix) {
-      var base = String(name || 'document');
-      var m = base.match(/^(.*?)(\.pdf)?$/i);
-      return (m && m[1] ? m[1] : base) + suffix;
+      var base = String(name == null ? '' : name);
+      var m = base.match(/^(.*?)(\.[^./\\]+)?$/);
+      var stem = (m && m[1]) ? m[1] : base;
+      if (!stem) stem = 'document';
+      return stem + suffix;
+    }
+
+    // Every tool creates object URLs that are handed to a download link. They are
+    // never released, so a long session leaks the whole generated file per run.
+    // Track them per tool and revoke them when the tool is closed.
+    var _toolUrls = [];
+    function trackUrl(url) { _toolUrls.push(url); return url; }
+    function releaseToolUrls() {
+      while (_toolUrls.length) {
+        var u = _toolUrls.pop();
+        try { URL.revokeObjectURL(u); } catch (_) {}
+      }
+    }
+
+    // pdf-lib's standard fonts are WinAnsi-encoded. Rather than surfacing a raw
+    // "WinAnsi cannot encode ..." error, explain what the user has to change.
+    function friendlyError(err) {
+      var msg = (err && err.message) ? String(err.message) : String(err);
+      if (/WinAnsi cannot encode|UnknownUnicode|not in the Adobe StandardEncoding/i.test(msg)) {
+        return 'Some characters cannot be drawn with the built-in PDF font (it only covers Latin-1). Remove emoji, symbols or non-Latin scripts and try again.';
+      }
+      if (/EncryptedPDFError|is encrypted/i.test(msg)) {
+        return 'This PDF is password protected. Use Unlock PDF first, then run this tool.';
+      }
+      if (/No PDF header found|Failed to parse PDF document|Invalid PDF structure/i.test(msg)) {
+        return 'This file is not a readable PDF. It may be corrupted or not a PDF at all.';
+      }
+      if (/The PDF file is empty/i.test(msg)) {
+        return 'This file is empty (0 bytes).';
+      }
+      if (/SOI not found in JPEG/i.test(msg)) {
+        return 'This file is not a JPEG. The tool could not decode the image data.';
+      }
+      return msg;
+    }
+
+    // pdf-lib's standard fonts only cover WinAnsi. Probing the whole string up
+    // front produces one clear error instead of a mid-loop throw.
+    function assertFontCanEncode(font, text) {
+      try {
+        font.widthOfTextAtSize(String(text == null ? '' : text), 12);
+      } catch (e) {
+        throw new Error('WinAnsi cannot encode this text');
+      }
+    }
+
+    // Last-resort repair: read the pages with pdf.js (which tolerates far more
+    // damage than pdf-lib) and rebuild a clean PDF from rendered bitmaps.
+    async function rebuildViaRenderer(buf) {
+      if (!window.pdfjsLib) throw new Error('PDF renderer unavailable');
+      var src = await pdfjsLib.getDocument({ data: new Uint8Array(buf.slice(0)), verbosity: 0 }).promise;
+      var out = await PDFDocument.create();
+      if (!src.numPages) throw new Error('No recoverable pages found');
+      for (var i = 1; i <= src.numPages; i++) {
+        var page = await src.getPage(i);
+        var vp = page.getViewport({ scale: 1.5 });
+        var canvas = document.createElement('canvas');
+        canvas.width = Math.floor(vp.width);
+        canvas.height = Math.floor(vp.height);
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+        var bytes = await new Promise(function (resolve, reject) {
+          canvas.toBlob(function (b) { b ? resolve(b.arrayBuffer()) : reject(new Error('encode failed')); }, 'image/jpeg', 0.85);
+        });
+        var img = await out.embedJpg(bytes);
+        var p = out.addPage([img.width, img.height]);
+        p.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+        page.cleanup();
+      }
+      try { src.destroy(); } catch (e) {}
+      return out;
+    }
+    // Shorten text with an ellipsis so it fits inside maxWidth.
+    function clipToWidth(text, font, size, maxWidth) {
+      var s = String(text == null ? '' : text);
+      if (!s) return '';
+      var width = function (t) {
+        try { return font.widthOfTextAtSize(t, size); } catch (e) { return t.length * size * 0.6; }
+      };
+      if (width(s) <= maxWidth) return s;
+      var out = s;
+      while (out.length > 1 && width(out + '...') > maxWidth) out = out.slice(0, -1);
+      return out + '...';
+    }
+    // Re-encode any browser-decodable image as JPEG bytes.
+    function toJpegBytes(file) {
+      return new Promise(function (resolve, reject) {
+        loadImageFile(file, function (img) {
+          var c = document.createElement('canvas');
+          c.width = img.naturalWidth || img.width;
+          c.height = img.naturalHeight || img.height;
+          var ctx = c.getContext('2d');
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, c.width, c.height);
+          ctx.drawImage(img, 0, 0);
+          c.toBlob(function (blob) {
+            if (!blob) { reject(new Error('Could not encode ' + file.name + ' as JPEG.')); return; }
+            blob.arrayBuffer().then(resolve, reject);
+          }, 'image/jpeg', 0.92);
+        }, function () { reject(new Error('This file could not be decoded as an image.')); });
+      });
+    }
+    // Decode an image File and report failure explicitly. A file can carry an
+    // image/* MIME type and still be undecodable, and the old FileReader path
+    // simply never called back, leaving the tool showing nothing at all.
+    // An object URL is used instead of readAsDataURL so a large photo is not
+    // base64-expanded in memory.
+    function loadImageFile(file, onLoad, onFail) {
+      var url = URL.createObjectURL(file);
+      var img = new Image();
+      var settled = false;
+      img.onload = function () {
+        if (settled) return;
+        settled = true;
+        URL.revokeObjectURL(url);
+        onLoad(img);
+      };
+      img.onerror = function () {
+        if (settled) return;
+        settled = true;
+        URL.revokeObjectURL(url);
+        if (onFail) onFail();
+      };
+      img.src = url;
+      return img;
+    }
+
+    var IMAGE_MIME_EXT = {
+      'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/pjpeg': '.jpg',
+      'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif',
+      'image/bmp': '.bmp'
+    };
+
+    // Encode a canvas and report the format the browser actually produced.
+    // Canvas silently falls back to PNG for types it cannot encode, so the
+    // extension has to be derived from the result, never from the request.
+    function canvasToBlob(canvas, type, quality) {
+      return new Promise(function (resolve, reject) {
+        try {
+          canvas.toBlob(function (blob) {
+            if (!blob) { reject(new Error('The image is too large for the browser to encode.')); return; }
+            var mime = blob.type || 'image/png';
+            resolve({ blob: blob, mime: mime, ext: IMAGE_MIME_EXT[mime] || '.png' });
+          }, type || 'image/png', quality);
+        } catch (e) { reject(e); }
+      });
+    }
+
+    // Greedy word wrap used by the text converters so long paragraphs and cells
+    // stay inside the page instead of running off the right edge.
+    function wrapText(text, font, size, maxWidth) {
+      var words = String(text == null ? '' : text).split(/\\s+/).filter(Boolean);
+      if (words.length === 0) return [''];
+      var lines = [];
+      var line = '';
+      for (var i = 0; i < words.length; i++) {
+        var candidate = line ? line + ' ' + words[i] : words[i];
+        var width;
+        try { width = font.widthOfTextAtSize(candidate, size); }
+        catch (e) { width = candidate.length * size * 0.6; }
+        if (width <= maxWidth || !line) {
+          // A single word longer than the line still has to be broken up.
+          if (!line && width > maxWidth) {
+            var chunk = '';
+            for (var c = 0; c < words[i].length; c++) {
+              var next = chunk + words[i][c];
+              var w2;
+              try { w2 = font.widthOfTextAtSize(next, size); } catch (e2) { w2 = next.length * size * 0.6; }
+              if (w2 > maxWidth && chunk) { lines.push(chunk); chunk = words[i][c]; }
+              else { chunk = next; }
+            }
+            line = chunk;
+            continue;
+          }
+          line = candidate;
+        } else {
+          lines.push(line);
+          line = words[i];
+        }
+      }
+      if (line) lines.push(line);
+      return lines;
     }
 
     // ---- REAL PDF COMPRESSION VIA GHOSTSCRIPT (WASM) ----
@@ -1152,6 +1336,7 @@
         }
 
         function renderFileList() {
+          if (self.state.sortable) { try { self.state.sortable.destroy(); } catch (_) {} self.state.sortable = null; }
           if (self.state.files.length === 0) { fileList.innerHTML = ''; btn.disabled = true; return; }
           var html = '<div class="text-sm font-medium text-slate-500 mb-2">' + self.state.files.length + ' file(s) selected</div>';
           html += '<div id="merge-sortable" class="space-y-2">';
@@ -1160,7 +1345,7 @@
             html += '<div class="file-item flex items-center gap-3 bg-white border border-slate-200 rounded-xl px-4 py-3" data-index="' + i + '">' +
               '<span class="cursor-grab text-slate-300"><i data-lucide="grip-vertical" style="width:16px;height:16px;"></i></span>' +
               '<span class="w-7 h-7 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center text-xs font-bold">' + (i + 1) + '</span>' +
-              '<div class="flex-1 min-w-0"><p class="text-sm font-medium text-slate-700 truncate">' + f.name + '</p><p class="text-xs text-slate-400">' + size + '</p></div>' +
+              '<div class="flex-1 min-w-0"><p class="text-sm font-medium text-slate-700 truncate">' + escapeHtml(f.name) + '</p><p class="text-xs text-slate-400">' + size + '</p></div>' +
               '<button class="merge-remove text-slate-400 hover:text-red-500 transition-colors p-1" data-index="' + i + '"><i data-lucide="x" style="width:16px;height:16px;"></i></button>' +
               '</div>';
           });
@@ -1180,7 +1365,7 @@
 
           // Sortable
           if (window.Sortable && document.getElementById('merge-sortable')) {
-            Sortable.create(document.getElementById('merge-sortable'), {
+            self.state.sortable = Sortable.create(document.getElementById('merge-sortable'), {
               animation: 200,
               handle: '.cursor-grab',
               ghostClass: 'sortable-ghost',
@@ -1214,19 +1399,24 @@
             }
             var bytes = await mergedPdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
+            var dl = outputFileName(self.state.files.length === 1 ? self.state.files[0].name : 'merged', '-merged.pdf');
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">✓ Merged successfully!</p><p class="text-sm text-emerald-600">' + self.state.files.length + ' PDFs · ' + mergedPdf.getPageCount() + ' pages · ' + formatSize(blob.size) + '</p></div>' +
-              '<a href="' + url + '" download="merged.pdf" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+              '<a href="' + url + '" download="' + escapeHtml(dl) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="copy" style="width:18px;height:18px;"></i> Merge PDFs'; lucide.createIcons();
         });
       },
-      cleanup: function () { this.state.files = []; }
+      cleanup: function () {
+        if (this.state.sortable) { try { this.state.sortable.destroy(); } catch (_) {} }
+        this.state.sortable = null;
+        this.state.files = [];
+      }
     };
 
     // ---- SPLIT PDF ----
@@ -1307,15 +1497,16 @@
                 zip.file('page-' + (i + 1).toString().padStart(String(total).length, '0') + '.pdf', bytes);
               }
               var zipContent = await zip.generateAsync({ type: 'blob' });
-              var url = URL.createObjectURL(zipContent);
+              var url = trackUrl(URL.createObjectURL(zipContent));
               result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
                 '<div><p class="font-semibold text-emerald-800">✓ Split into ' + total + ' pages!</p><p class="text-sm text-emerald-600">Downloading as ZIP archive</p></div>' +
-                '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-pages.zip') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download ZIP</a>' +
+                '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-pages.zip')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download ZIP</a>' +
                 '</div>';
             } else {
               var rangesStr = document.getElementById('split-ranges').value.trim();
               if (!rangesStr) { result.innerHTML = '<div class="p-4 bg-amber-50 text-amber-700 rounded-xl text-sm">Please enter page ranges.</div>'; btn.disabled = false; btn.innerHTML = '<i data-lucide="scissors" style="width:18px;height:18px;"></i> Split PDF'; lucide.createIcons(); return; }
-              var ranges = parseRanges(rangesStr, total);
+              var parsed = parseRanges(rangesStr, total);
+              var ranges = parsed.ranges;
               if (ranges.length === 0) { result.innerHTML = '<div class="p-4 bg-amber-50 text-amber-700 rounded-xl text-sm">No valid page ranges. Pages range from 1 to ' + total + '.</div>'; btn.disabled = false; btn.innerHTML = '<i data-lucide="scissors" style="width:18px;height:18px;"></i> Split PDF'; lucide.createIcons(); return; }
               var zip = new JSZip();
               var pdfs = [];
@@ -1330,15 +1521,20 @@
                 zip.file(pdfs[r].label + '.pdf', bytes);
               }
               var zipContent = await zip.generateAsync({ type: 'blob' });
-              var url = URL.createObjectURL(zipContent);
+              var url = trackUrl(URL.createObjectURL(zipContent));
+              // Parts that fell outside 1..total are dropped, so say so instead of
+              // quietly handing back fewer files than the user asked for.
+              var droppedNote = parsed.invalid.length
+                ? '<div class="mt-3 text-xs text-amber-600">Ignored out-of-range entries: ' + escapeHtml(parsed.invalid.join(', ')) + ' (valid pages are 1–' + total + ').</div>'
+                : '';
               result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
-                '<div><p class="font-semibold text-emerald-800">✓ Split into ' + pdfs.length + ' files!</p><p class="text-sm text-emerald-600">' + pdfs.length + ' PDFs · Downloading as ZIP</p></div>' +
-                '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-split.zip') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download ZIP</a>' +
+                '<div><p class="font-semibold text-emerald-800">✓ Split into ' + pdfs.length + ' files!</p><p class="text-sm text-emerald-600">' + pdfs.length + ' PDFs · Downloading as ZIP</p>' + droppedNote + '</div>' +
+                '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-split.zip')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download ZIP</a>' +
                 '</div>';
             }
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="scissors" style="width:18px;height:18px;"></i> Split PDF'; lucide.createIcons();
         });
@@ -1346,22 +1542,29 @@
         function parseRanges(str, totalPages) {
           var parts = str.split(',').map(function (s) { return s.trim(); });
           var result = [];
+          var invalid = [];
           for (var i = 0; i < parts.length; i++) {
             var part = parts[i];
+            if (!part) continue;
             if (/^\d+-\d+$/.test(part)) {
               var s = part.split('-');
-              var start = parseInt(s[0]), end = parseInt(s[1]);
+              var start = parseInt(s[0], 10), end = parseInt(s[1], 10);
               if (start >= 1 && end <= totalPages && start <= end) {
                 var arr = [];
                 for (var j = start - 1; j < end; j++) arr.push(j);
                 result.push(arr);
+              } else {
+                invalid.push(part);
               }
             } else if (/^\d+$/.test(part)) {
-              var p = parseInt(part);
+              var p = parseInt(part, 10);
               if (p >= 1 && p <= totalPages) result.push([p - 1]);
+              else invalid.push(part);
+            } else {
+              invalid.push(part);
             }
           }
-          return result;
+          return { ranges: result, invalid: invalid };
         }
       },
       cleanup: function () { this.state.file = null; this.state.mode = 'individual'; }
@@ -1475,7 +1678,7 @@
             }
 
             var blob = new Blob([bestBytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             var savings = originalSize - compressedSize;
             var pct = originalSize > 0 ? ((savings / originalSize) * 100).toFixed(1) : '0.0';
             var noteHtml = (note || warnings.length)
@@ -1483,13 +1686,13 @@
               : '';
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl">' +
               '<div class="flex items-center justify-between mb-4"><div><p class="font-semibold text-emerald-800">✓ Compression complete!</p></div>' +
-              '<a href="' + url + '" download="' + outputFileName(self.state.file.name, '-compressed.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a></div>' +
+              '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-compressed.pdf')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a></div>' +
               '<div class="grid grid-cols-3 gap-4 text-center"><div class="p-3 bg-white rounded-xl"><div class="text-xs text-slate-400 mb-1">Original</div><div class="font-bold text-slate-700">' + formatSize(originalSize) + '</div></div>' +
               '<div class="p-3 bg-white rounded-xl"><div class="text-xs text-slate-400 mb-1">Compressed</div><div class="font-bold text-emerald-600">' + formatSize(compressedSize) + '</div></div>' +
               '<div class="p-3 bg-white rounded-xl"><div class="text-xs text-slate-400 mb-1">Saved</div><div class="font-bold text-sky-600">' + pct + '%</div></div></div>' + noteHtml + '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(err.message) + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="archive" style="width:18px;height:18px;"></i> Compress PDF'; lucide.createIcons();
         });
@@ -1554,45 +1757,44 @@
 
             // Load thumbnails async (non-blocking — grid shows icons first)
             loadThumbnails(buf);
-
-            if (window.Sortable && document.getElementById('organize-sortable')) {
-              Sortable.create(document.getElementById('organize-sortable'), {
-                animation: 200,
-                ghostClass: 'sortable-ghost',
-                onEnd: function (evt) {
-                  var items = self.state.pages.splice(evt.oldIndex, 1);
-                  self.state.pages.splice(evt.newIndex, 0, items[0]);
-                  renderGrid();
-                }
-              });
-            }
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            controls.classList.add('hidden');
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
         }
 
+        // Rendering every page at once froze long documents, so only a bounded
+        // number of thumbnails is produced and they are rendered in small
+        // sequential batches that yield to the event loop.
+        var THUMB_LIMIT = 60;
         async function loadThumbnails(buf) {
+          if (!window.pdfjsLib) return;
+          var doc;
           try {
-            if (!window.pdfjsLib) return;
-            var pdfjsDoc = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
-            var promises = [];
-            for (var t = 0; t < self.state.total; t++) {
-              (function (pg) {
-                promises.push(pdfjsDoc.getPage(pg + 1).then(async function (page) {
-                  var vp = page.getViewport({ scale: 0.25 });
-                  var canvas = document.createElement('canvas');
-                  canvas.width = vp.width;
-                  canvas.height = vp.height;
-                  await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-                  self.state.thumbnails[pg] = canvas.toDataURL('image/jpeg', 0.6);
-                }));
-              })(t);
-            }
-            await Promise.all(promises);
-            renderGrid();
+            doc = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
           } catch (e) {
-            // Thumbnails are a visual enhancement — silent fail is acceptable
+            return; // thumbnails are a visual enhancement only
           }
+          var token = (self.state.thumbToken = (self.state.thumbToken || 0) + 1);
+          var upto = Math.min(self.state.total, THUMB_LIMIT);
+          try {
+            for (var pg = 0; pg < upto; pg++) {
+              if (token !== self.state.thumbToken) return;
+              var page = await doc.getPage(pg + 1);
+              var vp = page.getViewport({ scale: 0.25 });
+              var canvas = document.createElement('canvas');
+              canvas.width = Math.max(1, Math.floor(vp.width));
+              canvas.height = Math.max(1, Math.floor(vp.height));
+              await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+              self.state.thumbnails[pg] = canvas.toDataURL('image/jpeg', 0.6);
+              page.cleanup();
+              if (pg % 4 === 3) { renderGrid(); await new Promise(function (r) { setTimeout(r, 0); }); }
+            }
+          } catch (e) {
+            // a single unrenderable page must not abort the rest
+          }
+          try { doc.destroy(); } catch (e2) {}
+          if (token === self.state.thumbToken) renderGrid();
         }
 
         function renderGrid() {
@@ -1616,11 +1818,13 @@
           grid.innerHTML = html;
           info.textContent = self.state.pages.length + ' page(s) · Drag to reorder';
 
-          // Re-init sortable after DOM update
+          // Re-init sortable after DOM update. The old instance still listens on
+          // the detached node, so it has to be destroyed first.
+          if (self.state.sortable) { try { self.state.sortable.destroy(); } catch (_) {} self.state.sortable = null; }
           if (window.Sortable) {
             var sortEl = document.getElementById('organize-sortable');
             if (sortEl) {
-              Sortable.create(sortEl, {
+              self.state.sortable = Sortable.create(sortEl, {
                 animation: 200,
                 ghostClass: 'sortable-ghost',
                 onEnd: function (evt) {
@@ -1674,27 +1878,36 @@
             var buf = await self.state.file.arrayBuffer();
             var pdf = await PDFDocument.load(buf);
             var newPdf = await PDFDocument.create();
-            for (var i = 0; i < self.state.pages.length; i++) {
-              var p = self.state.pages[i];
-              var [copied] = await newPdf.copyPages(pdf, [p.index]);
-              if (p.rotation !== 0) copied.setRotation(PDFLib.degrees(copied.getRotation().angle + p.rotation));
-              newPdf.addPage(copied);
+            // One copyPages call for the whole selection: calling it per page made
+            // long documents dramatically slower because each call re-walks the
+            // source object graph.
+            var wanted = self.state.pages.map(function (p) { return p.index; });
+            var copied = await newPdf.copyPages(pdf, wanted);
+            for (var i = 0; i < copied.length; i++) {
+              var rot = self.state.pages[i].rotation;
+              if (rot !== 0) copied[i].setRotation(PDFLib.degrees(copied[i].getRotation().angle + rot));
+              newPdf.addPage(copied[i]);
             }
             var bytes = await newPdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">✓ Organized!</p><p class="text-sm text-emerald-600">' + self.state.pages.length + ' pages · ' + formatSize(blob.size) + '</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-organized.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+              '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-organized.pdf')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="check" style="width:18px;height:18px;"></i> Apply &amp; Download'; lucide.createIcons();
         });
       },
-      cleanup: function () { this.state.file = null; this.state.pages = []; this.state.total = 0; this.state.thumbnails = []; }
+      cleanup: function () {
+        if (this.state.sortable) { try { this.state.sortable.destroy(); } catch (_) {} }
+        this.state.sortable = null;
+        this.state.thumbToken = (this.state.thumbToken || 0) + 1;
+        this.state.file = null; this.state.pages = []; this.state.total = 0; this.state.thumbnails = [];
+      }
     };
 
     // ---- ROTATE PDF ----
@@ -1747,11 +1960,17 @@
             for (var i = 0; i < total; i++) rotations.push(0);
             controls.classList.remove('hidden');
             result.innerHTML = '';
-            info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + total + ' pages</p></div></div>';
+            info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + total + ' pages</p></div></div>';
             renderGrid();
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            // Leave the tool in its "nothing loaded" state: state.file is already
+            // set, so a failed load would otherwise let Apply produce nonsense.
+            self.state.file = null;
+            rotations = [];
+            controls.classList.add('hidden');
+            info.innerHTML = '';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
         }
 
@@ -1795,6 +2014,7 @@
         });
 
         document.getElementById('rotate-apply').addEventListener('click', async function () {
+          if (!self.state.file || !rotations.length) { result.innerHTML = '<div class="p-4 bg-amber-50 text-amber-700 rounded-xl text-sm">Load a PDF first.</div>'; return; }
           var btn = document.getElementById('rotate-apply');
           btn.disabled = true; btn.innerHTML = '<span class="spinner inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span> Processing...';
           result.innerHTML = '';
@@ -1810,14 +2030,14 @@
             }
             var bytes = await pdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">✓ Rotated!</p><p class="text-sm text-emerald-600">' + rotations.filter(function (r) { return r !== 0; }).length + ' pages rotated</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-rotated.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+              '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-rotated.pdf')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="check" style="width:18px;height:18px;"></i> Apply &amp; Download'; lucide.createIcons();
         });
@@ -1905,7 +2125,7 @@
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
           self.state.buffer = await file.arrayBuffer();
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           controls.classList.remove('hidden');
           previewBtn.classList.remove('hidden');
           previewSection.classList.add('hidden');
@@ -1998,6 +2218,9 @@
             var activePos = document.querySelector('#wm-controls .position-btn.active');
             var pos = activePos ? activePos.dataset.pos : 'center';
             var diagonal = document.getElementById('wm-diagonal').checked;
+            // Check once, up front: the standard font is WinAnsi-only, and a bad
+            // character would otherwise throw part-way through the page loop.
+            assertFontCanEncode(font, text);
 
             var pages = pdf.getPages();
             for (var i = 0; i < pages.length; i++) {
@@ -2015,12 +2238,15 @@
                 case 'bottom-left': x = 40; y = 20; rotation = 0; break;
                 case 'bottom': x = pw / 2 - textWidth / 2; y = 20; rotation = 0; break;
                 case 'bottom-right': x = pw - textWidth - 40; y = 20; rotation = 0; break;
-                default: x = pw / 2 - textWidth / 2; y = ph / 2 - size / 2; rotation = diagonal ? 45 : 0; break;
+                default: x = pw / 2 - textWidth / 2; y = ph / 2 - size / 2; rotation = 0; break;
               }
+              // A centred diagonal watermark is drawn about the page centre, so
+              // anchor it there rather than at the box's lower-left corner.
               if (pos === 'center' && diagonal) {
+                x = pw / 2 - textWidth / 2;
+                y = ph / 2 - size / 2;
                 page.drawText(text, {
-                  x: pw / 2 - textWidth / 2,
-                  y: ph / 2,
+                  x: x, y: y,
                   font: font, size: size,
                   color: rgb(colorArr[0], colorArr[1], colorArr[2]),
                   opacity: opacity,
@@ -2038,14 +2264,14 @@
             }
             var bytes = await pdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
-              '<div><p class="font-semibold text-emerald-800">✓ Watermark added!</p><p class="text-sm text-emerald-600">"' + text + '" on all ' + pages.length + ' pages</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-watermarked.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+              '<div><p class="font-semibold text-emerald-800">✓ Watermark added!</p><p class="text-sm text-emerald-600">"' + escapeHtml(text) + '" on all ' + pages.length + ' pages</p></div>' +
+              '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-watermarked.pdf')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="droplet" style="width:18px;height:18px;"></i> Add Watermark'; lucide.createIcons();
         });
@@ -2117,7 +2343,7 @@
         function loadFile(file) {
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           controls.classList.remove('hidden');
           btn.classList.remove('hidden');
           btn.disabled = false;
@@ -2141,9 +2367,30 @@
             var activePos = document.querySelector('#pn-controls .position-btn.active');
             var pos = activePos ? activePos.dataset.pos : 'bottom-center';
 
+            // Real roman-numeral conversion. The previous lookup table only went up
+            // to XV and returned a *number* beyond that, which drawText rejected
+            // ("must be of type string") and broke the whole tool.
+            function toRoman(n) {
+              if (n <= 0 || n >= 4000) return null;
+              var table = [
+                [1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'],
+                [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'],
+                [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']
+              ];
+              var out = '';
+              for (var i = 0; i < table.length; i++) {
+                while (n >= table[i][0]) { out += table[i][1]; n -= table[i][0]; }
+              }
+              return out;
+            }
+
             function formatNum(n, fmt) {
-              if (fmt === 'i') { var roman = ['','i','ii','iii','iv','v','vi','vii','viii','ix','x','xi','xii','xiii','xiv','xv']; return n <= 15 ? roman[n] : n; }
-              if (fmt === 'I') { var ROMAN = ['','I','II','III','IV','V','VI','VII','VIII','IX','X','XI','XII','XIII','XIV','XV']; return n <= 15 ? ROMAN[n] : n; }
+              if (fmt === 'i' || fmt === 'I') {
+                var r = toRoman(n);
+                // Roman numerals stop at 3999; fall back to arabic beyond that.
+                if (r === null) return String(n);
+                return fmt === 'i' ? r.toLowerCase() : r;
+              }
               if (fmt === '01') return String(n).padStart(2, '0');
               if (fmt === '001') return String(n).padStart(3, '0');
               return String(n);
@@ -2155,8 +2402,10 @@
               var pw = page.getWidth();
               var ph = page.getHeight();
               var num = formatNum(start + i, format);
-              var textW = num.length * size * 0.6;
               var margin = 40;
+              var textW;
+              try { textW = font.widthOfTextAtSize(num, size); }
+              catch (e) { textW = num.length * size * 0.6; }
               var x, y;
               switch (pos) {
                 case 'top-left': x = margin; y = ph - margin; break;
@@ -2174,14 +2423,14 @@
             }
             var bytes = await pdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
-              '<div><p class="font-semibold text-emerald-800">✓ Page numbers added!</p><p class="text-sm text-emerald-600">' + pages.length + ' pages numbered from ' + formatNum(start, format) + '</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-numbered.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+              '<div><p class="font-semibold text-emerald-800">✓ Page numbers added!</p><p class="text-sm text-emerald-600">' + pages.length + ' pages numbered from ' + escapeHtml(formatNum(start, format)) + '</p></div>' +
+              '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-numbered.pdf')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="list" style="width:18px;height:18px;"></i> Add Page Numbers'; lucide.createIcons();
         });
@@ -2241,7 +2490,7 @@
         async function loadFile(file) {
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           controls.classList.remove('hidden');
           btn.classList.remove('hidden');
           btn.disabled = false;
@@ -2272,14 +2521,14 @@
             }
             pdfjsDoc.destroy();
             var zipBlob = await zip.generateAsync({ type: 'blob' });
-            var url = URL.createObjectURL(zipBlob);
+            var url = trackUrl(URL.createObjectURL(zipBlob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">✓ Converted ' + total + ' page(s)!</p><p class="text-sm text-emerald-600">Downloading as ZIP archive</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-images.zip') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download ZIP</a>' +
+              '<a href="' + url + '" download="' + outputFileName(self.state.file.name, '-images.zip') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download ZIP</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="image" style="width:18px;height:18px;"></i> Convert to JPG'; lucide.createIcons();
         });
@@ -2338,7 +2587,7 @@
             html += '<div class="file-item flex items-center gap-3 bg-white border border-slate-200 rounded-xl px-4 py-3" data-index="' + i + '">' +
               '<span class="cursor-grab text-slate-300"><i data-lucide="grip-vertical" style="width:16px;height:16px;"></i></span>' +
               '<span class="w-7 h-7 rounded-lg bg-purple-100 text-purple-600 flex items-center justify-center text-xs font-bold">' + (i + 1) + '</span>' +
-              '<div class="flex-1 min-w-0"><p class="text-sm font-medium text-slate-700 truncate">' + f.name + '</p><p class="text-xs text-slate-400">' + formatSize(f.size) + '</p></div>' +
+              '<div class="flex-1 min-w-0"><p class="text-sm font-medium text-slate-700 truncate">' + escapeHtml(f.name) + '</p><p class="text-xs text-slate-400">' + formatSize(f.size) + '</p></div>' +
               '<button class="jpg2pdf-remove text-slate-400 hover:text-red-500 transition-colors p-1" data-index="' + i + '"><i data-lucide="x" style="width:16px;height:16px;"></i></button>' +
               '</div>';
           });
@@ -2357,8 +2606,9 @@
             });
           });
 
+          if (self.state.sortable) { try { self.state.sortable.destroy(); } catch (_) {} self.state.sortable = null; }
           if (window.Sortable && document.getElementById('jpg2pdf-sortable')) {
-            Sortable.create(document.getElementById('jpg2pdf-sortable'), {
+            self.state.sortable = Sortable.create(document.getElementById('jpg2pdf-sortable'), {
               animation: 200,
               handle: '.cursor-grab',
               ghostClass: 'sortable-ghost',
@@ -2388,11 +2638,16 @@
 
             for (var i = 0; i < self.state.files.length; i++) {
               var buf = await self.state.files[i].arrayBuffer();
+              var isPng = (self.state.files[i].type || '').toLowerCase() === 'image/png' ||
+                          self.state.files[i].name.toLowerCase().endsWith('.png');
               var img;
-              if (self.state.files[i].type === 'image/png' || self.state.files[i].name.toLowerCase().endsWith('.png')) {
+              if (isPng) {
                 img = await pdf.embedPng(buf);
               } else {
-                img = await pdf.embedJpg(buf);
+                // embedJpg only accepts JPEG bytes, so any other decodable
+                // format (WebP, GIF, BMP, AVIF) is re-encoded first.
+                var jpegBytes = await toJpegBytes(self.state.files[i]);
+                img = await pdf.embedJpg(jpegBytes);
               }
               var page;
               if (sizeOption === 'a4') {
@@ -2414,19 +2669,23 @@
             }
             var bytes = await pdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">✓ PDF created!</p><p class="text-sm text-emerald-600">' + self.state.files.length + ' pages · ' + formatSize(blob.size) + '</p></div>' +
               '<a href="' + url + '" download="converted.pdf" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="file-image" style="width:18px;height:18px;"></i> Create PDF'; lucide.createIcons();
         });
       },
-      cleanup: function () { this.state.files = []; }
+      cleanup: function () {
+        if (this.state.sortable) { try { this.state.sortable.destroy(); } catch (_) {} }
+        this.state.sortable = null;
+        this.state.files = [];
+      }
     };
 
     // ---- PDF TO PPT ----
@@ -2465,7 +2724,7 @@
         async function loadFile(file) {
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           btn.classList.remove('hidden');
           btn.disabled = false;
           result.innerHTML = '';
@@ -2494,14 +2753,14 @@
             }
             pdfjsDoc.destroy();
             var pptxBlob = await pptx.write({ outputType: 'blob' });
-            var url = URL.createObjectURL(pptxBlob);
+            var url = trackUrl(URL.createObjectURL(pptxBlob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">✓ Converted ' + total + ' page(s)!</p><p class="text-sm text-emerald-600">PPTX file ready</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '.pptx') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download PPTX</a>' +
+              '<a href="' + url + '" download="' + outputFileName(self.state.file.name, '.pptx') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download PPTX</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="file-text" style="width:18px;height:18px;"></i> Convert to PPT'; lucide.createIcons();
         });
@@ -2545,7 +2804,7 @@
         async function loadFile(file) {
           if (!file.name.toLowerCase().endsWith('.pptx')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="monitor" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="monitor" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           btn.classList.remove('hidden');
           btn.disabled = false;
           result.innerHTML = '';
@@ -2565,8 +2824,15 @@
                 slideFiles.push(path);
               }
             });
-            slideFiles.sort();
             if (slideFiles.length === 0) { throw new Error('No slides found in the PPTX file.'); }
+            // Sort by the number in the file name. A plain sort() is
+            // lexicographic and puts slide10 before slide2, which silently
+            // reordered every deck with 10 or more slides.
+            slideFiles.sort(function (a, b) {
+              var na = parseInt((a.match(/slide(\d+)\.xml\$/) || [0, 0])[1], 10);
+              var nb = parseInt((b.match(/slide(\d+)\.xml\$/) || [0, 0])[1], 10);
+              return na - nb;
+            });
             var pdf = await PDFDocument.create();
             var font = await pdf.embedFont(StandardFonts.Helvetica);
             for (var s = 0; s < slideFiles.length; s++) {
@@ -2581,20 +2847,27 @@
               for (var t = 0; t < tEls.length; t++) {
                 var text = tEls[t].textContent || '';
                 if (y < 40) { page = pdf.addPage([612, 792]); y = 750; }
-                page.drawText(text, { x: 50, y: y, font: font, size: 12, color: rgb(0.2, 0.2, 0.2) });
+                var wrapped;
+                try { assertFontCanEncode(font, text); wrapped = wrapText(text, font, 12, 612 - 100); }
+                catch (e) { wrapped = []; }
+                for (var wl = 0; wl < wrapped.length; wl++) {
+                  if (y < 40) { page = pdf.addPage([612, 792]); y = 750; }
+                  page.drawText(wrapped[wl], { x: 50, y: y, font: font, size: 12, color: rgb(0.2, 0.2, 0.2) });
+                  y -= 18;
+                }
                 y -= 18;
               }
             }
             var bytes = await pdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">✓ Converted ' + slideFiles.length + ' slides!</p><p class="text-sm text-emerald-600">' + formatSize(blob.size) + '</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pptx', '.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download PDF</a>' +
+              '<a href="' + url + '" download="' + outputFileName(self.state.file.name, '.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download PDF</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="monitor" style="width:18px;height:18px;"></i> Convert to PDF'; lucide.createIcons();
         });
@@ -2638,7 +2911,7 @@
         async function loadFile(file) {
           if (!file.name.toLowerCase().endsWith('.docx')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           btn.classList.remove('hidden');
           btn.disabled = false;
           result.innerHTML = '';
@@ -2656,32 +2929,50 @@
             if (!docXml) throw new Error('Invalid DOCX file.');
             var parser = new DOMParser();
             var xmlDoc = parser.parseFromString(docXml, 'text/xml');
+            if (xmlDoc.getElementsByTagName('parsererror').length) throw new Error('Invalid DOCX file.');
             var pEls = xmlDoc.getElementsByTagNameNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'p');
+            if (!pEls.length) throw new Error('No paragraphs found in this DOCX file.');
             var pdf = await PDFDocument.create();
             var font = await pdf.embedFont(StandardFonts.Helvetica);
             var page = pdf.addPage([612, 792]);
             var y = 750;
             var margin = 50;
+            var maxWidth = 612 - margin * 2;
+            var skipped = 0;
             for (var p = 0; p < pEls.length; p++) {
               var tChildren = pEls[p].getElementsByTagNameNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 't');
               var line = '';
               for (var t = 0; t < tChildren.length; t++) {
                 line += tChildren[t].textContent || '';
               }
-              if (y < 40) { page = pdf.addPage([612, 792]); y = 750; }
-              page.drawText(line || ' ', { x: margin, y: y, font: font, size: 11, color: rgb(0.15, 0.15, 0.15) });
-              y -= 16;
+              if (!line.trim()) { y -= 8; continue; }
+              var wrapped;
+              try {
+                assertFontCanEncode(font, line);
+                wrapped = wrapText(line, font, 11, maxWidth);
+              } catch (e) {
+                // Drop the paragraph instead of failing every other one: the
+                // built-in font cannot draw non-Latin scripts or emoji.
+                skipped++;
+                continue;
+              }
+              for (var li = 0; li < wrapped.length; li++) {
+                if (y < 40) { page = pdf.addPage([612, 792]); y = 750; }
+                page.drawText(wrapped[li] || ' ', { x: margin, y: y, font: font, size: 11, color: rgb(0.15, 0.15, 0.15) });
+                y -= 16;
+              }
             }
             var bytes = await pdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
-              '<div><p class="font-semibold text-emerald-800">✓ Converted!</p><p class="text-sm text-emerald-600">' + formatSize(blob.size) + '</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.docx', '.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download PDF</a>' +
+              '<div><p class="font-semibold text-emerald-800">✓ Converted!</p><p class="text-sm text-emerald-600">' + pdf.getPageCount() + ' pages · ' + formatSize(blob.size) + '</p>' +
+                (skipped ? '<div class="mt-3 text-xs text-amber-600">' + skipped + ' paragraph(s) skipped: the built-in PDF font cannot render their characters.</div>' : '') + '</div>' +
+              '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '.pdf')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download PDF</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="file-text" style="width:18px;height:18px;"></i> Convert to PDF'; lucide.createIcons();
         });
@@ -2725,7 +3016,7 @@
         async function loadFile(file) {
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           btn.classList.remove('hidden');
           btn.disabled = false;
           result.innerHTML = '';
@@ -2737,6 +3028,9 @@
           btn.disabled = true; btn.innerHTML = '<span class="spinner inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span> Converting...';
           result.innerHTML = '';
           try {
+            if (typeof docx === 'undefined' || !docx || !docx.Packer) {
+              throw new Error('The Word export library could not be loaded. Check your connection and reload the page.');
+            }
             var buf = await self.state.file.arrayBuffer();
             var pdfjsDoc = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
             var total = pdfjsDoc.numPages;
@@ -2745,27 +3039,39 @@
               var page = await pdfjsDoc.getPage(i);
               var vp = page.getViewport({ scale: 1.5 });
               var canvas = document.createElement('canvas');
-              canvas.width = vp.width;
-              canvas.height = vp.height;
+              canvas.width = Math.floor(vp.width);
+              canvas.height = Math.floor(vp.height);
               await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-              var imgData = canvas.toDataURL('image/jpeg', 0.85);
-              var imgResp = await fetch(imgData);
-              var imgBuffer = await imgResp.arrayBuffer();
-              var imageRun = docx.Media.addImage(doc, imgBuffer, vp.width, vp.height, { type: docx.ImageType.JPEG });
+              // JPEG bytes straight from the canvas: no data: URL round-trip.
+              var imgBuffer = await new Promise(function (resolve, reject) {
+                canvas.toBlob(function (b) { b ? resolve(b.arrayBuffer()) : reject(new Error('Could not encode page ' + i + '.')); }, 'image/jpeg', 0.85);
+              });
+              // docx 8.x takes an ImageRun directly; the old v7 helper
+              // (Media.addImage / ImageType) no longer exists in this build.
+              var imageRun = new docx.ImageRun({
+                data: imgBuffer,
+                transformation: { width: canvas.width, height: canvas.height }
+              });
+              // docx names media .png unconditionally, so correct the extension
+              // or Word is handed JPEG bytes under a PNG name.
+              if (typeof docx.uniqueId === 'function') {
+                try { imageRun.key = docx.uniqueId() + '.jpg'; } catch (e) { /* keep default */ }
+              }
               docChildren.push(new docx.Paragraph({ children: [imageRun], alignment: docx.AlignmentType.CENTER }));
               if (i < total) docChildren.push(new docx.PageBreak());
+              page.cleanup();
             }
             pdfjsDoc.destroy();
             var doc = new docx.Document({ sections: [{ children: docChildren }] });
             var docxBlob = await docx.Packer.toBlob(doc);
-            var url = URL.createObjectURL(docxBlob);
+            var url = trackUrl(URL.createObjectURL(docxBlob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
-              '<div><p class="font-semibold text-emerald-800">✓ Converted ' + total + ' page(s)!</p><p class="text-sm text-emerald-600">DOCX file ready</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '.docx') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download DOCX</a>' +
+              '<div><p class="font-semibold text-emerald-800">✓ Converted ' + total + ' page(s)!</p><p class="text-sm text-emerald-600">DOCX file ready · ' + formatSize(docxBlob.size) + '</p></div>' +
+              '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '.docx')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download DOCX</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="file" style="width:18px;height:18px;"></i> Convert to Word'; lucide.createIcons();
         });
@@ -2815,7 +3121,7 @@
         async function loadFile(file) {
           if (!file.name.toLowerCase().endsWith('.xlsx') && !file.name.toLowerCase().endsWith('.xls')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="table" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="table" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           try {
             var buf = await file.arrayBuffer();
             var wb = XLSX.read(buf, { type: 'array' });
@@ -2830,7 +3136,13 @@
             btn.classList.remove('hidden');
             btn.disabled = false;
           } catch (e) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error reading Excel file: ' + e.message + '</div>';
+            controls.classList.add('hidden');
+            btn.classList.add('hidden');
+            btn.disabled = true;
+            self.state.file = null;
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error reading Excel file: ' + escapeHtml(friendlyError(e)) + '</div>';
+            lucide.createIcons();
+            return;
           }
           result.innerHTML = '';
           lucide.createIcons();
@@ -2863,15 +3175,20 @@
               if (y < 30) { page = pdf.addPage([612, 792]); y = 750; }
               var isHeader = r === 0;
               for (var c = 0; c < data[r].length; c++) {
-                var cellText = String(data[r][c] !== undefined ? data[r][c] : '');
+                var cellText = String(data[r][c] !== undefined && data[r][c] !== null ? data[r][c] : '');
                 var fontSize = isHeader ? 10 : 9;
-                page.drawText(cellText, {
-                  x: margin + c * colW,
-                  y: y,
-                  font: font,
-                  size: fontSize,
-                  color: isHeader ? rgb(0.05, 0.05, 0.1) : rgb(0.2, 0.2, 0.2),
-                });
+                // Keep each value inside its own column instead of letting it
+                // overlap the next one and run off the right edge.
+                cellText = clipToWidth(cellText, font, fontSize, colW - 4);
+                if (cellText) {
+                  page.drawText(cellText, {
+                    x: margin + c * colW,
+                    y: y,
+                    font: font,
+                    size: fontSize,
+                    color: isHeader ? rgb(0.05, 0.05, 0.1) : rgb(0.2, 0.2, 0.2),
+                  });
+                }
                 if (isHeader) {
                   page.drawLine({
                     start: { x: margin, y: y - 2 },
@@ -2885,14 +3202,14 @@
             }
             var bytes = await pdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
-              '<div><p class="font-semibold text-emerald-800">✓ Converted!</p><p class="text-sm text-emerald-600">' + data.length + ' rows · ' + formatSize(blob.size) + '</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace(/\.(xlsx|xls)$/i, '.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download PDF</a>' +
+              '<div><p class="font-semibold text-emerald-800">✓ Converted!</p><p class="text-sm text-emerald-600">' + data.length + ' rows · ' + pdf.getPageCount() + ' pages · ' + formatSize(blob.size) + '</p></div>' +
+              '<a href="' + url + '" download="' + outputFileName(self.state.file.name, '.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download PDF</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="table" style="width:18px;height:18px;"></i> Convert to PDF'; lucide.createIcons();
         });
@@ -2929,6 +3246,7 @@
       },
       init: function () {
         var self = this;
+        var sourceMime = 'image/png';
         var dropzone = document.getElementById('compimg-dropzone');
         var input = document.getElementById('compimg-input');
         var info = document.getElementById('compimg-file-info');
@@ -2951,12 +3269,10 @@
         function loadFile(file) {
           if (!file.type.startsWith('image/')) return;
           self.state.file = file;
-          var reader = new FileReader();
-          reader.onload = function (e) {
-            var img = new Image();
-            img.onload = function () {
+          sourceMime = (file.type || 'image/png').toLowerCase();
+          loadImageFile(file, function (img) {
               self.state.image = img;
-              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
+              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
               var ctx = canvas.getContext('2d');
               var maxW = canvas.parentElement.clientWidth || 600;
               var scale = Math.min(1, maxW / img.width);
@@ -2969,10 +3285,9 @@
               btn.disabled = false;
               result.innerHTML = '';
               lucide.createIcons();
-            };
-            img.src = e.target.result;
-          };
-          reader.readAsDataURL(file);
+          }, function () {
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This file could not be decoded as an image. It may be corrupted, or in a format this browser does not support.</div>';
+          });
         }
 
         btn.addEventListener('click', function () {
@@ -2989,9 +3304,9 @@
             var ctx = c.getContext('2d');
             ctx.drawImage(img, 0, 0);
             c.toBlob(function (blob) {
-              var url = URL.createObjectURL(blob);
+              var url = trackUrl(URL.createObjectURL(blob));
               var ext = format === 'image/jpeg' ? '.jpg' : format === 'image/png' ? '.png' : '.webp';
-              var name = self.state.file.name.replace(/\.[^.]+$/, '') + '-compressed' + ext;
+              var name = outputFileName(self.state.file.name, '') + '-compressed' + ext;
               var pct = self.state.file.size > 0 ? ((1 - blob.size / self.state.file.size) * 100).toFixed(1) : '0.0';
               result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl">' +
                 '<div class="flex items-center justify-between mb-4"><div><p class="font-semibold text-emerald-800">✓ Compression complete!</p></div>' +
@@ -3002,7 +3317,7 @@
               btn.disabled = false; btn.innerHTML = '<i data-lucide="archive" style="width:18px;height:18px;"></i> Compress &amp; Download'; lucide.createIcons();
             }, format, quality);
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
             btn.disabled = false; btn.innerHTML = '<i data-lucide="archive" style="width:18px;height:18px;"></i> Compress &amp; Download'; lucide.createIcons();
           }
         });
@@ -3043,6 +3358,7 @@
       },
       init: function () {
         var self = this;
+        var sourceMime = 'image/png';
         var dropzone = document.getElementById('rsz-dropzone');
         var input = document.getElementById('rsz-input');
         var info = document.getElementById('rsz-file-info');
@@ -3069,12 +3385,10 @@
         function loadFile(file) {
           if (!file.type.startsWith('image/')) return;
           self.state.file = file;
-          var reader = new FileReader();
-          reader.onload = function (e) {
-            var img = new Image();
-            img.onload = function () {
+          sourceMime = (file.type || 'image/png').toLowerCase();
+          loadImageFile(file, function (img) {
               self.state.image = img;
-              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
+              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
               updateDimensions(img.width, img.height);
               var ctx = canvas.getContext('2d');
               var maxW = canvas.parentElement.clientWidth || 600;
@@ -3088,10 +3402,9 @@
               btn.disabled = false;
               result.innerHTML = '';
               lucide.createIcons();
-            };
-            img.src = e.target.result;
-          };
-          reader.readAsDataURL(file);
+          }, function () {
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This file could not be decoded as an image. It may be corrupted, or in a format this browser does not support.</div>';
+          });
         }
 
         wInput.addEventListener('input', function () {
@@ -3135,19 +3448,21 @@
             var ctx = c.getContext('2d');
             ctx.imageSmoothingEnabled = true;
             ctx.imageSmoothingQuality = 'high';
+            if (sourceMime === 'image/jpeg') { ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, w, h); }
             ctx.drawImage(img, 0, 0, w, h);
             c.toBlob(function (blob) {
-              var ext = self.state.file.name.match(/\.[^.]+$/);
-              ext = ext ? ext[0] : '.jpg';
-              var url = URL.createObjectURL(blob);
+              if (!blob) { result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(new Error('encode failed'))) + '</div>'; btn.disabled = false; return; }
+              var mime = blob.type || sourceMime;
+              var ext = IMAGE_MIME_EXT[mime] || '.png';
+              var url = trackUrl(URL.createObjectURL(blob));
               result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
                 '<div><p class="font-semibold text-emerald-800">✓ Resized to ' + w + 'x' + h + '!</p><p class="text-sm text-emerald-600">' + formatSize(blob.size) + '</p></div>' +
-                '<a href="' + url + '" download="' + self.state.file.name.replace(/\.[^.]+$/, '') + '-resized' + ext + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+                '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-resized' + ext)) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
                 '</div>';
               btn.disabled = false; btn.innerHTML = '<i data-lucide="maximize" style="width:18px;height:18px;"></i> Resize &amp; Download'; lucide.createIcons();
-            });
+            }, sourceMime, 0.92);
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
             btn.disabled = false; btn.innerHTML = '<i data-lucide="maximize" style="width:18px;height:18px;"></i> Resize &amp; Download'; lucide.createIcons();
           }
         });
@@ -3193,6 +3508,7 @@
       },
       init: function () {
         var self = this;
+        var sourceMime = 'image/png';
         var dropzone = document.getElementById('crop-dropzone');
         var input = document.getElementById('crop-input');
         var info = document.getElementById('crop-file-info');
@@ -3215,12 +3531,10 @@
           self.state.file = file;
           self.state.rotation = 0;
           self.state.crop = null;
-          var reader = new FileReader();
-          reader.onload = function (e) {
-            var img = new Image();
-            img.onload = function () {
+          sourceMime = (file.type || 'image/png').toLowerCase();
+          loadImageFile(file, function (img) {
               self.state.image = img;
-              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + img.width + 'x' + img.height + '</p></div></div>';
+              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + img.width + 'x' + img.height + '</p></div></div>';
               drawImage();
               preview.classList.remove('hidden');
               controls.classList.remove('hidden');
@@ -3228,10 +3542,9 @@
               btn.disabled = true;
               result.innerHTML = '';
               lucide.createIcons();
-            };
-            img.src = e.target.result;
-          };
-          reader.readAsDataURL(file);
+          }, function () {
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This file could not be decoded as an image. It may be corrupted, or in a format this browser does not support.</div>';
+          });
         }
 
         function drawImage() {
@@ -3409,17 +3722,19 @@
             var ctx2 = c2.getContext('2d');
             ctx2.drawImage(temp, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
             c2.toBlob(function (blob) {
-              var ext = self.state.file.name.match(/\.[^.]+$/);
-              ext = ext ? ext[0] : '.jpg';
-              var url = URL.createObjectURL(blob);
+              // Keep the source format. The callback still re-reads blob.type,
+              // because canvas silently falls back to PNG when it cannot
+              // encode the requested type.
+              var ext = IMAGE_MIME_EXT[blob.type] || '.png';
+              var url = trackUrl(URL.createObjectURL(blob));
               result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
                 '<div><p class="font-semibold text-emerald-800">✓ Cropped!</p><p class="text-sm text-emerald-600">' + cropW + 'x' + cropH + ' · ' + formatSize(blob.size) + '</p></div>' +
-                '<a href="' + url + '" download="' + self.state.file.name.replace(/\.[^.]+$/, '') + '-cropped' + ext + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+                '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-cropped' + ext)) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
                 '</div>';
               btn.disabled = false; btn.innerHTML = '<i data-lucide="crop" style="width:18px;height:18px;"></i> Crop &amp; Download'; lucide.createIcons();
-            });
+            }, sourceMime, 0.92);
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
             btn.disabled = false; btn.innerHTML = '<i data-lucide="crop" style="width:18px;height:18px;"></i> Crop &amp; Download'; lucide.createIcons();
           }
         });
@@ -3455,6 +3770,7 @@
       },
       init: function () {
         var self = this;
+        var sourceMime = 'image/png';
         var dropzone = document.getElementById('rotimg-dropzone');
         var input = document.getElementById('rotimg-input');
         var info = document.getElementById('rotimg-file-info');
@@ -3501,12 +3817,10 @@
           if (!file.type.startsWith('image/')) return;
           self.state.file = file;
           self.state.rotation = 0;
-          var reader = new FileReader();
-          reader.onload = function (e) {
-            var img = new Image();
-            img.onload = function () {
+          sourceMime = (file.type || 'image/png').toLowerCase();
+          loadImageFile(file, function (img) {
               self.state.image = img;
-              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + img.width + 'x' + img.height + '</p></div></div>';
+              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + img.width + 'x' + img.height + '</p></div></div>';
               preview.classList.remove('hidden');
               controls.classList.remove('hidden');
               btn.classList.remove('hidden');
@@ -3514,10 +3828,9 @@
               result.innerHTML = '';
               renderPreview();
               lucide.createIcons();
-            };
-            img.src = e.target.result;
-          };
-          reader.readAsDataURL(file);
+          }, function () {
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This file could not be decoded as an image. It may be corrupted, or in a format this browser does not support.</div>';
+          });
         }
 
         document.getElementById('rotimg-cw').addEventListener('click', function () {
@@ -3553,17 +3866,20 @@
             ctx.drawImage(img, -sw / 2, -sh / 2, sw, sh);
             ctx.restore();
             c.toBlob(function (blob) {
-              var ext = self.state.file.name.match(/\.[^.]+$/);
-              ext = ext ? ext[0] : '.jpg';
-              var url = URL.createObjectURL(blob);
+              if (!blob) { result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This image is too large for the browser to encode. Try a smaller source image.</div>'; btn.disabled = false; return; }
+              // Keep the source format. The callback still re-reads blob.type,
+              // because canvas silently falls back to PNG when it cannot
+              // encode the requested type.
+              var ext = IMAGE_MIME_EXT[blob.type] || '.png';
+              var url = trackUrl(URL.createObjectURL(blob));
               result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
                 '<div><p class="font-semibold text-emerald-800">✓ Rotated ' + angle + '°!</p><p class="text-sm text-emerald-600">' + cw + 'x' + ch + ' · ' + formatSize(blob.size) + '</p></div>' +
-                '<a href="' + url + '" download="' + self.state.file.name.replace(/\.[^.]+$/, '') + '-rotated' + ext + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+                '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-rotated' + ext)) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
                 '</div>';
               btn.disabled = false; btn.innerHTML = '<i data-lucide="rotate-cw" style="width:18px;height:18px;"></i> Apply &amp; Download'; lucide.createIcons();
-            });
+            }, sourceMime, 0.92);
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
             btn.disabled = false; btn.innerHTML = '<i data-lucide="rotate-cw" style="width:18px;height:18px;"></i> Apply &amp; Download'; lucide.createIcons();
           }
         });
@@ -3602,6 +3918,7 @@
       },
       init: function () {
         var self = this;
+        var sourceMime = 'image/png';
         var dropzone = document.getElementById('up-dropzone');
         var input = document.getElementById('up-input');
         var info = document.getElementById('up-file-info');
@@ -3631,16 +3948,14 @@
         function loadFile(file) {
           if (!file.type.startsWith('image/')) return;
           self.state.file = file;
-          var reader = new FileReader();
-          reader.onload = function (e) {
-            var img = new Image();
-            img.onload = function () {
+          sourceMime = (file.type || 'image/png').toLowerCase();
+          loadImageFile(file, function (img) {
               self.state.image = img;
               origDims.textContent = img.width + 'x' + img.height;
               wInput.value = img.width * 2;
               hInput.value = img.height * 2;
               updateEstimate();
-              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
+              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
               var ctx = canvas.getContext('2d');
               var maxW = canvas.parentElement.clientWidth || 600;
               var scale = Math.min(1, maxW / img.width);
@@ -3653,10 +3968,9 @@
               btn.disabled = false;
               result.innerHTML = '';
               lucide.createIcons();
-            };
-            img.src = e.target.result;
-          };
-          reader.readAsDataURL(file);
+          }, function () {
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This file could not be decoded as an image. It may be corrupted, or in a format this browser does not support.</div>';
+          });
         }
 
         wInput.addEventListener('input', updateEstimate);
@@ -3698,17 +4012,20 @@
             ctx.imageSmoothingQuality = 'high';
             ctx.drawImage(img, 0, 0, w, h);
             c.toBlob(function (blob) {
-              var ext = self.state.file.name.match(/\.[^.]+$/);
-              ext = ext ? ext[0] : '.jpg';
-              var url = URL.createObjectURL(blob);
+              if (!blob) { result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This image is too large for the browser to encode. Try a smaller source image.</div>'; btn.disabled = false; return; }
+              // Keep the source format. The callback still re-reads blob.type,
+              // because canvas silently falls back to PNG when it cannot
+              // encode the requested type.
+              var ext = IMAGE_MIME_EXT[blob.type] || '.png';
+              var url = trackUrl(URL.createObjectURL(blob));
               result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
                 '<div><p class="font-semibold text-emerald-800">✓ Upscaled to ' + w + 'x' + h + '!</p><p class="text-sm text-emerald-600">' + formatSize(blob.size) + '</p></div>' +
-                '<a href="' + url + '" download="' + self.state.file.name.replace(/\.[^.]+$/, '') + '-upscaled' + ext + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+                '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-upscaled' + ext)) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
                 '</div>';
               btn.disabled = false; btn.innerHTML = '<i data-lucide="zoom-in" style="width:18px;height:18px;"></i> Upscale &amp; Download'; lucide.createIcons();
-            });
+            }, sourceMime, 0.92);
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
             btn.disabled = false; btn.innerHTML = '<i data-lucide="zoom-in" style="width:18px;height:18px;"></i> Upscale &amp; Download'; lucide.createIcons();
           }
         });
@@ -3759,6 +4076,7 @@
       },
       init: function () {
         var self = this;
+        var sourceMime = 'image/png';
         var dropzone = document.getElementById('wmimg-dropzone');
         var input = document.getElementById('wmimg-input');
         var info = document.getElementById('wmimg-file-info');
@@ -3798,12 +4116,10 @@
         function loadFile(file) {
           if (!file.type.startsWith('image/')) return;
           self.state.file = file;
-          var reader = new FileReader();
-          reader.onload = function (e) {
-            var img = new Image();
-            img.onload = function () {
+          sourceMime = (file.type || 'image/png').toLowerCase();
+          loadImageFile(file, function (img) {
               self.state.image = img;
-              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
+              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
               controls.classList.remove('hidden');
               previewBtn.classList.remove('hidden');
               previewSection.classList.add('hidden');
@@ -3811,10 +4127,9 @@
               btn.disabled = false;
               result.innerHTML = '';
               lucide.createIcons();
-            };
-            img.src = e.target.result;
-          };
-          reader.readAsDataURL(file);
+          }, function () {
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This file could not be decoded as an image. It may be corrupted, or in a format this browser does not support.</div>';
+          });
         }
 
         function updatePreview() {
@@ -3910,17 +4225,20 @@
             }
             ctx.restore();
             c.toBlob(function (blob) {
-              var ext = self.state.file.name.match(/\.[^.]+$/);
-              ext = ext ? ext[0] : '.jpg';
-              var url = URL.createObjectURL(blob);
+              if (!blob) { result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This image is too large for the browser to encode. Try a smaller source image.</div>'; btn.disabled = false; return; }
+              // Keep the source format. The callback still re-reads blob.type,
+              // because canvas silently falls back to PNG when it cannot
+              // encode the requested type.
+              var ext = IMAGE_MIME_EXT[blob.type] || '.png';
+              var url = trackUrl(URL.createObjectURL(blob));
               result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
                 '<div><p class="font-semibold text-emerald-800">✓ Watermark added!</p><p class="text-sm text-emerald-600">"' + text + '" · ' + formatSize(blob.size) + '</p></div>' +
-                '<a href="' + url + '" download="' + self.state.file.name.replace(/\.[^.]+$/, '') + '-watermarked' + ext + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+                '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-watermarked' + ext)) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
                 '</div>';
               btn.disabled = false; btn.innerHTML = '<i data-lucide="droplet" style="width:18px;height:18px;"></i> Add Watermark'; lucide.createIcons();
-            });
+            }, sourceMime, 0.92);
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
             btn.disabled = false; btn.innerHTML = '<i data-lucide="droplet" style="width:18px;height:18px;"></i> Add Watermark'; lucide.createIcons();
           }
         });
@@ -3958,6 +4276,7 @@
       },
       init: function () {
         var self = this;
+        var sourceMime = 'image/png';
         var dropzone = document.getElementById('cjpg-dropzone');
         var input = document.getElementById('cjpg-input');
         var info = document.getElementById('cjpg-file-info');
@@ -3980,12 +4299,10 @@
         function loadFile(file) {
           if (!file.type.startsWith('image/')) return;
           self.state.file = file;
-          var reader = new FileReader();
-          reader.onload = function (e) {
-            var img = new Image();
-            img.onload = function () {
+          sourceMime = (file.type || 'image/png').toLowerCase();
+          loadImageFile(file, function (img) {
               self.state.image = img;
-              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
+              info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="image" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + ' · ' + img.width + 'x' + img.height + '</p></div></div>';
               var ctx = canvas.getContext('2d');
               var maxW = canvas.parentElement.clientWidth || 600;
               var scale = Math.min(1, maxW / img.width);
@@ -4000,10 +4317,9 @@
               btn.disabled = false;
               result.innerHTML = '';
               lucide.createIcons();
-            };
-            img.src = e.target.result;
-          };
-          reader.readAsDataURL(file);
+          }, function () {
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">This file could not be decoded as an image. It may be corrupted, or in a format this browser does not support.</div>';
+          });
         }
 
         btn.addEventListener('click', function () {
@@ -4021,8 +4337,8 @@
             ctx.fillRect(0, 0, c.width, c.height);
             ctx.drawImage(img, 0, 0);
             c.toBlob(function (blob) {
-              var url = URL.createObjectURL(blob);
-              var name = self.state.file.name.replace(/\.[^.]+$/, '') + '.jpg';
+              var url = trackUrl(URL.createObjectURL(blob));
+              var name = outputFileName(self.state.file.name, '') + '.jpg';
               result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
                 '<div><p class="font-semibold text-emerald-800">✓ Converted to JPG!</p><p class="text-sm text-emerald-600">' + img.width + 'x' + img.height + ' · ' + formatSize(blob.size) + '</p></div>' +
                 '<a href="' + url + '" download="' + name + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
@@ -4030,7 +4346,7 @@
               btn.disabled = false; btn.innerHTML = '<i data-lucide="image" style="width:18px;height:18px;"></i> Convert to JPG'; lucide.createIcons();
             }, 'image/jpeg', quality);
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
             btn.disabled = false; btn.innerHTML = '<i data-lucide="image" style="width:18px;height:18px;"></i> Convert to JPG'; lucide.createIcons();
           }
         });
@@ -4090,7 +4406,7 @@
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
           self.state.pages = [];
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           controls.classList.remove('hidden');
           btn.classList.remove('hidden');
           btn.disabled = false;
@@ -4143,7 +4459,7 @@
 
             pdfjsDoc.destroy();
 
-            var displayText = fullText.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+            var displayText = escapeHtml(fullText).replace(/\n/g, '<br>');
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl">' +
               '<div class="flex items-center justify-between mb-4"><div><p class="font-semibold text-emerald-800">✓ OCR Complete!</p><p class="text-sm text-emerald-600">' + total + ' pages processed</p></div>' +
               '<button id="ocr-download-btn" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download Text</button></div>' +
@@ -4154,16 +4470,16 @@
 
             document.getElementById('ocr-download-btn').addEventListener('click', function () {
               var blob = new Blob([fullText], { type: 'text/plain' });
-              var url = URL.createObjectURL(blob);
+              var url = trackUrl(URL.createObjectURL(blob));
               var a = document.createElement('a');
               a.href = url;
-              a.download = self.state.file.name.replace('.pdf', '-ocr.txt');
+              a.download = outputFileName(self.state.file.name, '-ocr.txt');
               a.click();
               URL.revokeObjectURL(url);
             });
 
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
 
           btn.disabled = false; btn.innerHTML = '<i data-lucide="scan" style="width:18px;height:18px;"></i> Run OCR'; lucide.createIcons();
@@ -4215,7 +4531,7 @@
         function loadFile(file) {
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           controls.classList.remove('hidden');
           btn.classList.remove('hidden');
           btn.disabled = false;
@@ -4242,14 +4558,14 @@
             // Standard native PDF 128-bit RC4 encryption
             var encryptedBytes = await encryptPDF(new Uint8Array(buf), password);
             var blob = new Blob([encryptedBytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">✓ PDF protected!</p><p class="text-sm text-emerald-600">Standard 128-bit PDF Encryption · ' + formatSize(buf.byteLength) + ' → ' + formatSize(blob.size) + '</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-protected.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+              '<a href="' + url + '" download="' + outputFileName(self.state.file.name, '-protected.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="lock" style="width:18px;height:18px;"></i> Protect PDF'; lucide.createIcons();
         });
@@ -4297,22 +4613,12 @@
         function loadFile(file) {
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           controls.classList.remove('hidden');
           btn.classList.remove('hidden');
           btn.disabled = false;
           result.innerHTML = '';
           lucide.createIcons();
-        }
-
-        function base64ToBuf(str) {
-          var binary = atob(str);
-          var len = binary.length;
-          var bytes = new Uint8Array(len);
-          for (var i = 0; i < len; i++) {
-            bytes[i] = binary.charCodeAt(i);
-          }
-          return bytes.buffer;
         }
 
         btn.addEventListener('click', async function () {
@@ -4363,15 +4669,15 @@
             }
 
             var blob = new Blob([cleanBytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             var msg = wasEncrypted ? 'Password removed · Metadata stripped' : 'Metadata stripped · PDF optimized';
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">' + (wasEncrypted ? '✓ PDF unlocked!' : '✓ PDF processed!') + '</p><p class="text-sm text-emerald-600">' + msg + ' · ' + formatSize(blob.size) + '</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('-protected.pdf', '').replace('.pdf', '-unlocked.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+              '<a href="' + url + '" download="' + outputFileName(self.state.file.name.replace(/-protected(\.pdf)?$/i, ''), '-unlocked.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="unlock" style="width:18px;height:18px;"></i> Unlock PDF'; lucide.createIcons();
         });
@@ -4429,7 +4735,7 @@
         function loadFile(file) {
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           var dateInput = document.getElementById('sign-date');
           if (dateInput && !dateInput.value) dateInput.value = dateStr;
           controls.classList.remove('hidden');
@@ -4454,6 +4760,12 @@
             var pdf = await PDFDocument.load(buf);
             var font = await pdf.embedFont(StandardFonts.Helvetica);
             var boldFont = await pdf.embedFont(StandardFonts.HelveticaBold);
+            // The built-in fonts are WinAnsi-only, so reject an undrawable
+            // name up front rather than failing part-way through the page.
+            assertFontCanEncode(font, name);
+            assertFontCanEncode(font, title);
+            assertFontCanEncode(font, dateVal);
+            assertFontCanEncode(font, reason);
             var pages = pdf.getPages();
             var page = pages[pages.length - 1];
             var pw = page.getWidth();
@@ -4535,14 +4847,14 @@
 
             var bytes = await pdf.save();
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
-              '<div><p class="font-semibold text-emerald-800">✓ PDF signed!</p><p class="text-sm text-emerald-600">Signed by ' + name + ' on ' + dateVal + ' · ' + formatSize(blob.size) + '</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-signed.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+              '<div><p class="font-semibold text-emerald-800">✓ PDF signed!</p><p class="text-sm text-emerald-600">Signed by ' + escapeHtml(name) + ' on ' + escapeHtml(dateVal) + ' · ' + formatSize(blob.size) + '</p></div>' +
+              '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-signed.pdf')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="pen-tool" style="width:18px;height:18px;"></i> Sign PDF'; lucide.createIcons();
         });
@@ -4585,7 +4897,7 @@
         function loadFile(file) {
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           btn.classList.remove('hidden');
           btn.disabled = false;
           result.innerHTML = '';
@@ -4599,22 +4911,34 @@
           try {
             var buf = await self.state.file.arrayBuffer();
             var originalSize = buf.byteLength;
-            var repaired = false;
             var pdf;
+            var viaRenderer = false;
 
-            // Attempt 1: Standard load
+            // An encrypted document cannot be repaired: the object streams are
+            // ciphertext, so rebuilding the structure would just reproduce a
+            // file that still needs the password. Say so instead of claiming
+            // success and handing back an unreadable PDF.
             try {
-              pdf = await PDFDocument.load(buf, { ignoreEncryption: true });
-              repaired = true;
+              var probe = await PDFDocument.load(buf.slice(0), { ignoreEncryption: true, updateMetadata: false });
+              if (probe.context.trailerInfo.Encrypt) {
+                throw new Error('This PDF is password protected, so it cannot be repaired. Use Unlock PDF first, then repair the result if it still will not open.');
+              }
+            } catch (probeErr) {
+              if (/password protected/.test(probeErr.message)) throw probeErr;
+              // Unreadable by pdf-lib: fall through to the renderer below.
+            }
+
+            // Attempt 1: a straight structural rebuild.
+            try {
+              pdf = await PDFDocument.load(buf, { updateMetadata: false });
             } catch (e1) {
-              // Attempt 2: Try copying pages to fresh document
+              // Attempt 2: pdf.js is far more tolerant of damaged files, so
+              // render whatever it can read and rebuild from the bitmaps.
+              // The old code repeated attempt 1 verbatim here, which could
+              // never succeed.
               try {
-                var partialPdf = await PDFDocument.load(buf, { ignoreEncryption: true });
-                pdf = await PDFDocument.create();
-                var indices = partialPdf.getPageIndices();
-                var pages = await pdf.copyPages(partialPdf, indices);
-                pages.forEach(function (p) { pdf.addPage(p); });
-                repaired = true;
+                pdf = await rebuildViaRenderer(buf);
+                viaRenderer = true;
               } catch (e2) {
                 throw new Error('Could not repair this PDF. The file may be too severely corrupted. (' + e2.message + ')');
               }
@@ -4625,17 +4949,19 @@
             pdf.setKeywords([]); pdf.setProducer(''); pdf.setCreator('');
             var bytes = await pdf.save({ useObjectStreams: true });
             var blob = new Blob([bytes], { type: 'application/pdf' });
-            var url = URL.createObjectURL(blob);
+            var url = trackUrl(URL.createObjectURL(blob));
             var savedSize = bytes.byteLength;
-            var details = 'Rebuilt document structure · Stripped metadata';
+            var details = viaRenderer
+              ? 'Pages recovered by re-rendering (text is no longer selectable) · Stripped metadata'
+              : 'Rebuilt document structure · Stripped metadata';
             if (pdf.getPageCount() > 0) details += ' · ' + pdf.getPageCount() + ' pages preserved';
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">' +
               '<div><p class="font-semibold text-emerald-800">✓ PDF repaired!</p><p class="text-sm text-emerald-600">' + details + ' · ' + formatSize(savedSize) + '</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-repaired.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
+              '<a href="' + url + '" download="' + escapeHtml(outputFileName(self.state.file.name, '-repaired.pdf')) + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a>' +
               '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(friendlyError(err)) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="wrench" style="width:18px;height:18px;"></i> Repair PDF'; lucide.createIcons();
         });
@@ -4650,6 +4976,7 @@
         var tool = TOOLS[toolId];
         if (!tool) return;
         if (this.currentTool) TOOLS[this.currentTool].cleanup();
+        releaseToolUrls();
         this.currentTool = toolId;
         document.getElementById('landing-content').classList.add('hidden');
         document.getElementById('tool-overlay').classList.add('active');
@@ -4664,6 +4991,7 @@
           TOOLS[this.currentTool].cleanup();
           this.currentTool = null;
         }
+        releaseToolUrls();
         document.getElementById('landing-content').classList.remove('hidden');
         document.getElementById('tool-overlay').classList.remove('active');
         document.getElementById('tool-content').innerHTML = '';

@@ -17,18 +17,18 @@
 | **Organize PDF** | Reorder, remove, and rearrange pages via drag-and-drop |
 | **Rotate PDF** | Rotate individual pages by 90°, 180°, or 270° |
 | **Watermark PDF** | Add text watermarks with custom position, color, opacity, and rotation |
-| **Page Numbers** | Insert page numbers with customizable position and style |
+| **Page Numbers** | Insert page numbers with customizable position and format (arabic, zero-padded, or roman numerals up to 3999) |
 
 ### 🔄 Conversion
 | Tool | Description |
 |------|-------------|
 | **PDF to PPT** | Convert PDF pages to PowerPoint slides |
-| **PPT to PDF** | Convert PowerPoint files to PDF |
+| **PPT to PDF** | Convert PowerPoint files to PDF (slides are read in their real order) |
 | **PDF to JPG** | Export PDF pages as JPEG images |
-| **JPG to PDF** | Create a PDF from JPEG images |
-| **Word to PDF** | Convert DOCX documents to PDF |
-| **PDF to Word** | Convert PDF to DOCX format |
-| **Excel to PDF** | Convert XLSX spreadsheets to PDF |
+| **JPG to PDF** | Create a PDF from JPG, PNG, WebP and other browser-decodable images |
+| **Word to PDF** | Convert DOCX documents to PDF, with word wrapping |
+| **PDF to Word** | Convert PDF pages to a Word document |
+| **Excel to PDF** | Convert XLSX spreadsheets to PDF, with columns clipped to the page |
 
 ### 🔒 Security
 | Tool | Description |
@@ -36,7 +36,7 @@
 | **Protect PDF** | Encrypt PDFs with password protection (Standard 128-bit RC4) |
 | **Unlock PDF** | Remove password protection from encrypted PDFs |
 | **Sign PDF** | Draw or type signatures onto PDF documents |
-| **Repair PDF** | Fix corrupted or malformed PDF files |
+| **Repair PDF** | Rebuild the internal structure of damaged PDF files. Files with a broken cross-reference table are recovered by re-rendering; a file that is password protected is rejected with a pointer to Unlock PDF, since it cannot be structurally repaired |
 
 ### 🤖 AI Workflows
 | Tool | Description |
@@ -52,11 +52,16 @@
 |------|-------------|
 | **Compress Image** | Reduce image file size with quality control |
 | **Resize Image** | Scale images to custom dimensions |
-| **Crop Image** | Interactive cropping with adjustable region |
-| **Rotate Image** | Rotate and flip images |
+| **Crop Image** | Interactive cropping with adjustable region and aspect-ratio lock |
+| **Rotate Image** | Rotate images in 90° steps |
 | **Upscale Image** | Increase image resolution |
 | **Watermark Image** | Add text watermarks to images |
 | **Convert to JPG** | Convert images (PNG, WebP, etc.) to JPEG format |
+
+> **Note on image formats:** every image tool preserves the source format, and the
+> download extension always matches the bytes that were actually produced. JPEG in
+> means JPEG out, PNG in means PNG out — the file name never misrepresents the
+> contents.
 
 ---
 
@@ -75,6 +80,17 @@ All processing is powered by industry-standard open-source libraries compiled to
 - **[SortableJS](https://sortablejs.github.io/Sortable/)** — Drag-and-drop page reordering
 
 The Protect PDF / Unlock PDF tools implement **Standard PDF 2.0 (128-bit RC4)** encryption natively in JavaScript, fully compatible with Adobe Acrobat, Chrome, Edge, Safari, Preview, and all standard PDF readers.
+
+### Font coverage
+
+The text-based PDF tools (watermark, page numbers, sign, Word→PDF, Excel→PDF,
+PPT→PDF) draw with pdf-lib's built-in **WinAnsi** fonts, which cover Latin-1
+only. Non-Latin scripts and emoji cannot be rendered with them. Rather than
+failing midway through a document, these tools now:
+
+- **Sign / Watermark:** reject the input up front with a message naming the cause.
+- **Word / Excel / PPT→PDF:** skip the affected lines or paragraphs and report
+  how many were skipped, so the rest of the document still converts.
 
 ---
 
