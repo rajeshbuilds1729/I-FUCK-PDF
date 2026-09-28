@@ -345,13 +345,55 @@
       return (bytes / 1048576).toFixed(1) + ' MB';
     }
 
+    // File names and error messages come from user data and are interpolated into
+    // innerHTML, so they have to be escaped.
+    function escapeHtml(str) {
+      return String(str == null ? '' : str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    // Strip a trailing .pdf (any casing) and append the new suffix, so that
+    // 'REPORT.PDF' becomes 'REPORT-compressed.pdf' rather than staying untouched.
+    function outputFileName(name, suffix) {
+      var base = String(name || 'document');
+      var m = base.match(/^(.*?)(\.pdf)?$/i);
+      return (m && m[1] ? m[1] : base) + suffix;
+    }
+
     // ---- REAL PDF COMPRESSION VIA GHOSTSCRIPT (WASM) ----
     // pdf-lib cannot recompress images, so we run Ghostscript in a Web Worker.
     // It genuinely re-encodes/downsamples image streams (the bulk of PDF size).
     const GS_WASM_BASE = 'https://cdn.jsdelivr.net/npm/@jspawn/ghostscript-wasm@0.0.2/';
+    const GS_TIMEOUT_BASE_MS = 120000;
+    const GS_TIMEOUT_PER_MB_MS = 15000;
     let _gsWorker = null;
+    let _gsWorkerUrl = null;
     let _gsReqId = 0;
     const _gsWaiters = {};
+
+    // Reject every in-flight request with one reason.
+    function gsFailAll(reason) {
+      Object.keys(_gsWaiters).forEach(function (id) {
+        var w = _gsWaiters[id];
+        delete _gsWaiters[id];
+        clearTimeout(w.timer);
+        w.reject(new Error(reason));
+      });
+    }
+
+    // A worker that failed to load (or wedged) stays broken forever, so every later
+    // request would queue behind a dead message port and never settle. Throw it away
+    // and let the next call build a fresh one.
+    function gsDropWorker() {
+      if (_gsWorker) { try { _gsWorker.terminate(); } catch (_) {} }
+      if (_gsWorkerUrl) { try { URL.revokeObjectURL(_gsWorkerUrl); } catch (_) {} }
+      _gsWorker = null;
+      _gsWorkerUrl = null;
+    }
 
     function getGsWorker() {
       if (_gsWorker) return _gsWorker;
@@ -360,11 +402,16 @@
         "let modPromise = null;",
         "self.onmessage = async (e) => {",
         "  const { id, bytes, setting } = e.data;",
+        "  let gs = null;",
         "  try {",
         "    if (!modPromise) modPromise = createModule({ locateFile: (f) => '" + GS_WASM_BASE + "' + f });",
-        "    const gs = await modPromise;",
+        "    gs = await modPromise;",
+        // Clear any leftovers first: a run that died midway can leave a partial
+        // output.pdf behind, and a later run would happily read that stale file.
+        "    try { gs.FS.unlink('input.pdf'); } catch (_) {}",
+        "    try { gs.FS.unlink('output.pdf'); } catch (_) {}",
         "    gs.FS.writeFile('input.pdf', new Uint8Array(bytes));",
-        "    gs.callMain([",
+        "    const code = gs.callMain([",
         "      '-sDEVICE=pdfwrite',",
         "      '-dCompatibilityLevel=1.4',",
         "      '-dPDFSETTINGS=/' + setting,",
@@ -372,28 +419,33 @@
         "      '-sOutputFile=output.pdf',",
         "      'input.pdf'",
         "    ]);",
-        "    const out = gs.FS.readFile('output.pdf');",
-        "    try { gs.FS.unlink('input.pdf'); } catch (_) {}",
-        "    try { gs.FS.unlink('output.pdf'); } catch (_) {}",
-        "    self.postMessage({ id, ok: true, out });",
+        "    let out = null;",
+        "    try { out = gs.FS.readFile('output.pdf'); } catch (_) {}",
+        "    if (!out) throw new Error('Ghostscript produced no output (exit code ' + code + ')');",
+        "    self.postMessage({ id, ok: true, out: out, code: code });",
         "  } catch (err) {",
         "    self.postMessage({ id, ok: false, error: String((err && err.message) || err) });",
+        "  } finally {",
+        "    if (gs) {",
+        "      try { gs.FS.unlink('input.pdf'); } catch (_) {}",
+        "      try { gs.FS.unlink('output.pdf'); } catch (_) {}",
+        "    }",
         "  }",
         "};"
       ].join('\n');
-      _gsWorker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' })), { type: 'module' });
+      _gsWorkerUrl = URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' }));
+      _gsWorker = new Worker(_gsWorkerUrl, { type: 'module' });
       _gsWorker.onmessage = function (e) {
-        const w = _gsWaiters[e.data.id];
+        var w = _gsWaiters[e.data.id];
         if (!w) return;
         delete _gsWaiters[e.data.id];
+        clearTimeout(w.timer);
         if (e.data.ok) w.resolve(e.data.out);
         else w.reject(new Error(e.data.error));
       };
       _gsWorker.onerror = function (e) {
-        Object.keys(_gsWaiters).forEach(function (id) {
-          _gsWaiters[id].reject(new Error('Compression engine failed to load: ' + e.message));
-          delete _gsWaiters[id];
-        });
+        gsFailAll('Compression engine failed to load' + ((e && e.message) ? ': ' + e.message : ''));
+        gsDropWorker();
       };
       return _gsWorker;
     }
@@ -401,10 +453,57 @@
     function compressWithGs(arrayBuffer, setting) {
       const worker = getGsWorker();
       const id = ++_gsReqId;
+      const bytes = arrayBuffer.byteLength || 0;
+      const timeout = GS_TIMEOUT_BASE_MS + Math.ceil(bytes / 1048576) * GS_TIMEOUT_PER_MB_MS;
       return new Promise(function (resolve, reject) {
-        _gsWaiters[id] = { resolve: resolve, reject: reject };
+        var settled = false;
+        var timer = setTimeout(function () {
+          if (settled) return;
+          settled = true;
+          delete _gsWaiters[id];
+          // The worker is in an unknown state, so rebuild it for the next attempt.
+          gsDropWorker();
+          reject(new Error('Ghostscript timed out after ' + Math.round(timeout / 1000) + 's.'));
+        }, timeout);
+        _gsWaiters[id] = {
+          resolve: function (v) { if (settled) return; settled = true; resolve(v); },
+          reject: function (e) { if (settled) return; settled = true; reject(e); },
+          timer: timer
+        };
         worker.postMessage({ id: id, bytes: arrayBuffer, setting: setting });
       });
+    }
+
+    // Ghostscript exits 0 even when it cannot read the document at all: for an
+    // encrypted or damaged PDF it writes a syntactically valid but EMPTY one-page
+    // file. Trusting that would silently hand the user a blank document, so every
+    // result is parsed and its page count is checked against the source.
+    async function inspectPdfBytes(bytes) {
+      var head = '';
+      for (var i = 0; i < 5; i++) head += String.fromCharCode(bytes[i]);
+      if (head !== '%PDF-') return { ok: false, reason: 'output is not a PDF' };
+      try {
+        var doc = await PDFDocument.load(bytes.slice(0));
+        var pages = doc.getPageCount();
+        if (!pages) return { ok: false, reason: 'output has no pages' };
+        return { ok: true, pages: pages };
+      } catch (e) {
+        return { ok: false, reason: 'output could not be parsed (' + e.message + ')' };
+      }
+    }
+
+    // Returns the page count, or throws a message that is safe to show the user.
+    async function readSourcePdf(buf) {
+      if (!buf || !buf.byteLength) throw new Error('That file is empty.');
+      try {
+        var doc = await PDFDocument.load(buf);
+        return { pages: doc.getPageCount() };
+      } catch (e) {
+        if (/encrypted/i.test(e.message)) {
+          throw new Error('This PDF is password protected. Use Unlock PDF first, then compress it.');
+        }
+        throw new Error('This file could not be read as a PDF (' + e.message + ').');
+      }
     }
 
     // Fallback used only if Ghostscript fails to load (e.g. offline).
@@ -1173,13 +1272,12 @@
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
           self.state.buffer = await file.arrayBuffer();
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
-          controls.classList.remove('hidden');
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          options.classList.remove('hidden');
           btn.classList.remove('hidden');
           btn.disabled = false;
           result.innerHTML = '';
           lucide.createIcons();
-          updatePreview();
         }
 
         // Radio toggle
@@ -1273,10 +1371,10 @@
     TOOLS['compress-pdf'] = {
       name: 'Compress PDF',
       icon: 'archive',
-      state: { file: null },
+      state: { file: null, buffer: null, sourcePages: 0 },
       render: function () {
         return '<div class="max-w-3xl mx-auto">' +
-          '<div class="mb-8"><h3 class="text-2xl font-bold mb-2">Compress PDF</h3><p class="text-slate-500">Reduce PDF file size by removing redundant data and optimizing structure.</p></div>' +
+          '<div class="mb-8"><h3 class="text-2xl font-bold mb-2">Compress PDF</h3><p class="text-slate-500">Reduce PDF file size by re-encoding images and downsampling them to the chosen DPI.</p></div>' +
           '<div id="compress-dropzone" class="drop-zone p-10 sm:p-14 text-center mb-6">' +
           '<div class="flex flex-col items-center gap-3"><i data-lucide="upload" style="width:40px;height:40px;" class="text-slate-300"></i>' +
           '<p class="text-slate-500 font-medium">Drop a PDF here or <span class="text-sky-600 underline">browse</span></p></div>' +
@@ -1287,7 +1385,7 @@
           '<div><label class="text-sm font-medium text-slate-700 mb-1 block">Compression level</label>' +
           '<select id="compress-level" class="w-full border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-sky-500 bg-white">' +
           '<option value="fast">Fast — highest quality (300 DPI)</option><option value="normal" selected>Normal — balanced (150 DPI)</option><option value="max">Maximum — smallest file (72 DPI)</option></select></div>' +
-          '<div class="text-xs text-slate-400"><i data-lucide="info" style="width:14px;height:14px;display:inline;"></i> Powered by Ghostscript (WASM). Images are re-encoded and downsampled to the chosen DPI — this is what actually shrinks most PDFs.</div>' +
+          '<div class="text-xs text-slate-400"><i data-lucide="info" style="width:14px;height:14px;display:inline;"></i> Powered by Ghostscript (WASM). Images are re-encoded and downsampled to the chosen DPI — this is what actually shrinks most PDFs. Text-only PDFs often cannot be made smaller, in which case the original is returned untouched.</div>' +
           '</div>' +
           '<button id="compress-btn" class="btn-primary text-white font-semibold px-6 py-3 rounded-xl inline-flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed hidden" disabled><i data-lucide="archive" style="width:18px;height:18px;"></i> Compress PDF</button>' +
           '<div id="compress-result" class="mt-6"></div>' +
@@ -1312,13 +1410,13 @@
           if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return;
           self.state.file = file;
           self.state.buffer = await file.arrayBuffer();
-          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + file.name + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
+          self.state.sourcePages = 0;
+          info.innerHTML = '<div class="flex items-center gap-3 p-4 bg-sky-50 border border-sky-200 rounded-xl"><div class="w-10 h-10 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><p class="text-sm font-medium text-sky-800">' + escapeHtml(file.name) + '</p><p class="text-xs text-sky-600">' + formatSize(file.size) + '</p></div></div>';
           controls.classList.remove('hidden');
           btn.classList.remove('hidden');
           btn.disabled = false;
           result.innerHTML = '';
           lucide.createIcons();
-          updatePreview();
         }
 
         btn.addEventListener('click', async function () {
@@ -1334,13 +1432,37 @@
             var buf = self.state.buffer || await self.state.file.arrayBuffer();
             var originalSize = buf.byteLength;
 
+            // Read the source up front: this rejects encrypted, empty and malformed
+            // files with a readable message instead of feeding them to Ghostscript.
+            var source = await readSourcePdf(buf);
+            self.state.sourcePages = source.pages;
+
             result.innerHTML = '<div class="p-4 bg-sky-50 text-sky-700 rounded-xl text-sm">Preparing compression engine… (first run downloads ~15 MB)</div>';
-            var bestBytes;
+            var bestBytes = null;
+            var warnings = [];
             try {
               bestBytes = await compressWithGs(buf, setting);
             } catch (gsErr) {
-              // Engine unavailable (e.g. offline) — fall back to metadata/structure cleanup.
+              warnings.push('Ghostscript was unavailable (' + gsErr.message + ').');
+            }
+
+            if (bestBytes) {
+              // Never trust the engine blindly — see inspectPdfBytes().
+              var check = await inspectPdfBytes(bestBytes);
+              if (!check.ok) {
+                warnings.push('Ghostscript returned an unusable result (' + check.reason + ').');
+                bestBytes = null;
+              } else if (check.pages !== source.pages) {
+                warnings.push('Ghostscript changed the page count (' + source.pages + ' → ' + check.pages + '), so the result was discarded.');
+                bestBytes = null;
+              }
+            }
+
+            // Fallback only strips metadata and rebuilds structure. It does not
+            // shrink images, so say so plainly rather than implying real savings.
+            if (!bestBytes) {
               bestBytes = await fallbackCompress(buf, level);
+              warnings.push('Only structure and metadata were cleaned up — image data was left as-is.');
             }
 
             var compressedSize = bestBytes.length;
@@ -1349,27 +1471,30 @@
             if (compressedSize >= originalSize) {
               bestBytes = new Uint8Array(buf);
               compressedSize = originalSize;
-              note = '<div class="mt-3 text-xs text-amber-600">This file is already optimised — Ghostscript could not reduce it further, so the original was kept.</div>';
+              note = 'This PDF is already optimised — no smaller version could be produced, so the original was returned.';
             }
 
             var blob = new Blob([bestBytes], { type: 'application/pdf' });
             var url = URL.createObjectURL(blob);
             var savings = originalSize - compressedSize;
             var pct = originalSize > 0 ? ((savings / originalSize) * 100).toFixed(1) : '0.0';
+            var noteHtml = (note || warnings.length)
+              ? '<div class="mt-3 text-xs text-amber-600">' + escapeHtml([note].concat(warnings).filter(Boolean).join(' ')) + '</div>'
+              : '';
             result.innerHTML = '<div class="result-card p-5 bg-emerald-50 border border-emerald-200 rounded-xl">' +
               '<div class="flex items-center justify-between mb-4"><div><p class="font-semibold text-emerald-800">✓ Compression complete!</p></div>' +
-              '<a href="' + url + '" download="' + self.state.file.name.replace('.pdf', '-compressed.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a></div>' +
+              '<a href="' + url + '" download="' + outputFileName(self.state.file.name, '-compressed.pdf') + '" class="bg-emerald-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition-all flex items-center gap-2"><i data-lucide="download" style="width:16px;height:16px;"></i> Download</a></div>' +
               '<div class="grid grid-cols-3 gap-4 text-center"><div class="p-3 bg-white rounded-xl"><div class="text-xs text-slate-400 mb-1">Original</div><div class="font-bold text-slate-700">' + formatSize(originalSize) + '</div></div>' +
               '<div class="p-3 bg-white rounded-xl"><div class="text-xs text-slate-400 mb-1">Compressed</div><div class="font-bold text-emerald-600">' + formatSize(compressedSize) + '</div></div>' +
-              '<div class="p-3 bg-white rounded-xl"><div class="text-xs text-slate-400 mb-1">Saved</div><div class="font-bold text-sky-600">' + pct + '%</div></div></div>' + note + '</div>';
+              '<div class="p-3 bg-white rounded-xl"><div class="text-xs text-slate-400 mb-1">Saved</div><div class="font-bold text-sky-600">' + pct + '%</div></div></div>' + noteHtml + '</div>';
             lucide.createIcons();
           } catch (err) {
-            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + err.message + '</div>';
+            result.innerHTML = '<div class="p-4 bg-red-50 text-red-700 rounded-xl text-sm">Error: ' + escapeHtml(err.message) + '</div>';
           }
           btn.disabled = false; btn.innerHTML = '<i data-lucide="archive" style="width:18px;height:18px;"></i> Compress PDF'; lucide.createIcons();
         });
       },
-      cleanup: function () { this.state.file = null; }
+      cleanup: function () { this.state.file = null; this.state.buffer = null; this.state.sourcePages = 0; }
     };
 
     // ---- ORGANIZE PDF ----
