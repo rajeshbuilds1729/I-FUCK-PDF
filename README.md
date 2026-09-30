@@ -2,11 +2,18 @@
 
 > **Your Files Never Leave Your Browser** — A privacy-first, fully client-side PDF and image processing suite.
 
-30+ document and image tools that run entirely in your browser via WebAssembly. **No uploads. No servers. No sign-up. No data ever leaves your device.**
+30 tools (26 working, 4 in progress) for document and image work that run entirely in
+your browser via WebAssembly. **No uploads. No servers. No sign-up. No data ever leaves
+your device.**
 
 ---
 
 ## ✨ Features
+
+Find a tool by searching or filtering by category — or press <kbd>/</kbd> to jump
+straight to the search field. Every tool opens in a focused workspace: drop a file,
+adjust the options, download the result. Tools are deep-linkable (`#merge-pdf`), so
+you can bookmark or share a specific job.
 
 ### 📄 Edit Workflows
 | Tool | Description |
@@ -35,7 +42,7 @@
 |------|-------------|
 | **Protect PDF** | Encrypt PDFs with password protection (Standard 128-bit RC4) |
 | **Unlock PDF** | Remove password protection from encrypted PDFs |
-| **Sign PDF** | Draw or type signatures onto PDF documents |
+| **Sign PDF** | Add a dated signature block to the last page |
 | **Repair PDF** | Rebuild the internal structure of damaged PDF files. Files with a broken cross-reference table are recovered by re-rendering; a file that is password protected is rejected with a pointer to Unlock PDF, since it cannot be structurally repaired |
 
 ### 🤖 AI Workflows
@@ -128,7 +135,8 @@ Then open `http://localhost:8000` in your browser.
 
 | Layer | Technology |
 |-------|-----------|
-| **UI** | Tailwind CSS (CDN), Lucide Icons |
+| **UI** | Tailwind CSS (CDN) for layout scaffolding, a custom token + component layer for everything visual, Lucide Icons |
+| **Typography** | Inter (interface), JetBrains Mono (machine values) |
 | **PDF** | PDF-Lib, pdf.js |
 | **Office** | PptxGenJS, docx, SheetJS |
 | **OCR** | Tesseract.js |
@@ -150,6 +158,68 @@ The entire application is a **single HTML file** — no build tools, no package 
 
 ---
 
+## 🎨 Design System
+
+The interface is one restrained system rather than a per-screen set of styles.
+Adding a tool means composing existing parts, not inventing new ones.
+
+**Palette budget — a warm paper canvas, one ink, a three-step neutral ramp, and a
+single chromatic accent** reserved for trust and success signals. Nothing else gets
+a hue, which is what keeps 30 tools looking like one product.
+
+| Role | Token | Value |
+|------|-------|-------|
+| Canvas | `--canvas` | `#fafaf9` |
+| Surface | `--surface` | `#ffffff` |
+| Muted surface | `--surface-2` | `#f4f3f0` |
+| Hairline | `--line` | `#e5e4de` |
+| Ink (also the primary action) | `--ink` | `#1a1a17` |
+| Body text | `--ink-2` | `#45443e` |
+| Secondary text (≥ 4.5:1) | `--muted` | `#6a6960` |
+| Accent — trust & success | `--brand` | `#0f6b52` |
+| Danger / warning | `--danger` / `--warn` | `#9f2d1c` / `#7d4f0d` |
+
+**Other decisions**
+
+- **Hierarchy from type and space**, not borders and shadows. Shadows are reserved
+  for what genuinely floats: the header, dialogs, the sticky action bar.
+- **A 4 / 6 / 8 / 12 px radius scale**, used deliberately rather than one radius
+  applied everywhere.
+- **Inter for interface text, JetBrains Mono for machine values** — file sizes, page
+  counts, pixel dimensions, engine names. Mono is what makes a metadata line read as
+  data rather than a sentence.
+- **Motion is 110–280 ms**, easing out, and is fully disabled under
+  `prefers-reduced-motion`.
+- **One focus ring everywhere** (a 2 px ink outline) and no `outline: none` without
+  a replacement.
+
+**Shared components** live in one place near the top of the script, so a screen is
+described rather than hand-built:
+
+| Helper | Produces |
+|--------|----------|
+| `UI.panel` `UI.field` `UI.range` `UI.toggle` `UI.select` | Settings blocks and form controls |
+| `UI.chipGroup` `UI.tileGroup` `UI.swatches` `UI.picker` | Exclusive choice groups |
+| `UI.dropzone` `UI.fileCard` | File input and selected-file summary |
+| `UI.action` `UI.secondaryAction` `Wire.actions` `Wire.actionPair` | Buttons and the sticky action bar |
+| `UI.alert` `UI.result` `UI.note` | Success, error, warning and aside states |
+| `UI.pageGrid` `UI.fileRows` | Thumbnail grids and multi-file lists |
+| `Wire.fail` `Wire.warn` | The shared failure and "not quite" paths |
+
+**Accessibility**
+
+- Every control is a real `<button>`, `<a>` or labelled form field — no click
+  handlers on `<div>`s.
+- Position pickers, colour swatches and option groups are keyboard-operable and
+  expose `aria-pressed`.
+- Results announce through `role="status"`, failures through `role="alert"`, and the
+  tool search announces its result count on every keystroke.
+- `Escape` closes a workspace or dialog and returns focus to where it came from.
+  `/` focuses the search field.
+- Tools are deep-linkable (`#merge-pdf`), and focus moves into the workspace on open.
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! Since the entire app is a single HTML file, most changes are straightforward:
@@ -157,6 +227,18 @@ Contributions are welcome! Since the entire app is a single HTML file, most chan
 1. Fork the repository
 2. Make your changes in `index.html`
 3. Submit a pull request
+
+### Adding a tool
+
+1. Add an entry to `TOOL_META` (name, category, icon, a one-line description and a
+   capability tag). This is what makes it appear in the library — the landing page
+   has no hard-coded tool list.
+2. Add a `TOOLS['<id>']` definition with `name`, `icon`, `state`, `render()`,
+   `init()` and `cleanup()`.
+3. Build the screen from the `UI` helpers above. Keep every `id` unique and
+   prefixed with the tool id.
+4. `render()` returns markup only; `init()` wires behaviour. With no build step and
+   no framework, keeping the two apart is what prevents them drifting.
 
 ---
 
